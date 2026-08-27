@@ -20,4 +20,3 @@ jobs:
           python-version: "3.12"
       - run: python -m py_compile codex_theme_core.py
       - run: python -m unittest discover -s tests -v
-

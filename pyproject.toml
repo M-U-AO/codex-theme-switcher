@@ -21,4 +21,3 @@ Issues = "https://github.com/M-U-AO/codex-theme-switcher/issues"
 [tool.ruff]
 line-length = 99
 target-version = "py310"
-

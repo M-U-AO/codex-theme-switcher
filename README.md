@@ -160,4 +160,3 @@ python -m py_compile codex_theme_core.py
 ## License
 
 [MIT](LICENSE)
-

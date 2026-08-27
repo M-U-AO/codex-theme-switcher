@@ -18,4 +18,3 @@ if ($null -ne $pythonLauncher) {
 
 Write-Error "需要 Python 3.10 或更高版本"
 exit 1
-
