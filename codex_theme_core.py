@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import platform
+import posixpath
 import queue
 import random
 import re
@@ -20,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,7 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 THEME_PREFIX = "codex-theme-v1:"
 DEFAULT_INDEX_URL = (
     "https://raw.githubusercontent.com/shaw-baobao/codex-themes/"
@@ -36,6 +39,14 @@ DEFAULT_INDEX_URL = (
 USER_AGENT = f"codex-theme-switcher/{VERSION}"
 WINDOWS_TASK_NAME = "CodexThemeSwitcherDaily"
 MACOS_LAUNCH_AGENT = "dev.muao.codex-theme-switcher"
+MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024
+DOWNLOAD_ATTEMPTS = 3
+MAX_THEME_ITEMS = 512
+MAX_THEME_DEPTH = 8
+MAX_THEME_STRING_LENGTH = 4096
+SAFE_THEME_KEY = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
+SAFE_THEME_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+SAFE_THEME_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 
 class ThemeError(RuntimeError):
@@ -60,19 +71,59 @@ def state_path() -> Path:
     return state_directory() / "state.json"
 
 
-def _read_url(url: str, timeout: int = 20) -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+def _https_origin(url: str) -> tuple[str, str, int]:
+    if len(url) > 2048 or any(
+        ord(character) <= 32 or ord(character) == 127 for character in url
+    ):
+        raise ThemeError(f"URL 包含无效字符或长度过长: {url!r}")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read().decode("utf-8-sig")
-    except (urllib.error.URLError, TimeoutError, UnicodeDecodeError) as exc:
-        raise ThemeError(f"无法读取 {url}: {exc}") from exc
+        parsed = urllib.parse.urlparse(url)
+        port = parsed.port or 443
+    except ValueError as exc:
+        raise ThemeError(f"无效 URL: {url}") from exc
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ThemeError(f"只允许 HTTPS URL: {url}")
+    if parsed.username or parsed.password:
+        raise ThemeError(f"URL 不允许包含用户名或密码: {url}")
+    if parsed.fragment:
+        raise ThemeError(f"URL 不允许包含片段: {url}")
+    return "https", parsed.hostname.lower(), port
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"不允许的 JSON 数字: {value}")
+
+
+def _read_url(url: str, timeout: int = 20) -> str:
+    requested_origin = _https_origin(url)
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                final_url = response.geturl()
+                if _https_origin(final_url) != requested_origin or final_url != url:
+                    raise ThemeError(f"拒绝远程重定向: {url} -> {final_url}")
+                content = response.read(MAX_DOWNLOAD_BYTES + 1)
+                if len(content) > MAX_DOWNLOAD_BYTES:
+                    raise ThemeError(f"远程内容超过 {MAX_DOWNLOAD_BYTES} 字节限制: {url}")
+                return content.decode("utf-8-sig")
+        except urllib.error.HTTPError as exc:
+            raise ThemeError(f"无法读取 {url}: HTTP {exc.code}") from exc
+        except UnicodeDecodeError as exc:
+            raise ThemeError(f"无法读取 {url}: 内容不是有效 UTF-8") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt + 1 >= DOWNLOAD_ATTEMPTS:
+                raise ThemeError(f"无法读取 {url}: {exc}") from exc
+            time.sleep(0.25 * (2**attempt))
+    raise AssertionError("unreachable")
 
 
 def load_theme_index(index_url: str = DEFAULT_INDEX_URL) -> list[dict[str, Any]]:
     try:
-        document = json.loads(_read_url(index_url))
-    except json.JSONDecodeError as exc:
+        document = json.loads(
+            _read_url(index_url), parse_constant=_reject_json_constant
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
         raise ThemeError(f"主题索引不是有效 JSON: {exc}") from exc
     themes = document.get("themes") if isinstance(document, dict) else None
     if not isinstance(themes, list):
@@ -81,7 +132,8 @@ def load_theme_index(index_url: str = DEFAULT_INDEX_URL) -> list[dict[str, Any]]
     for item in themes:
         if not isinstance(item, dict):
             continue
-        if not isinstance(item.get("slug"), str):
+        slug = item.get("slug")
+        if not isinstance(slug, str) or not SAFE_THEME_SLUG.fullmatch(slug):
             continue
         if item.get("mode") not in {"light", "dark"}:
             continue
@@ -95,10 +147,77 @@ def load_theme_index(index_url: str = DEFAULT_INDEX_URL) -> list[dict[str, Any]]
 
 def theme_import_url(theme: dict[str, Any], index_url: str) -> str:
     import_path = str(theme["import"])
-    if urllib.parse.urlparse(import_path).scheme:
-        return import_path
-    # index.json is under themes/, while entries are rooted at the repository.
-    return urllib.parse.urljoin(index_url, "../" + import_path.lstrip("/"))
+    index_origin = _https_origin(index_url)
+    # index.json is under themes/, while entries are rooted at the repository ref.
+    repository_base = urllib.parse.urljoin(index_url, "../")
+    resolved = urllib.parse.urljoin(repository_base, import_path.lstrip("/"))
+    if _https_origin(resolved) != index_origin:
+        raise ThemeError(f"主题导入 URL 必须与索引同源: {resolved}")
+    base_path = (
+        posixpath.normpath(urllib.parse.unquote(urllib.parse.urlparse(repository_base).path))
+        .rstrip("/")
+        + "/"
+    )
+    resolved_path = posixpath.normpath(
+        urllib.parse.unquote(urllib.parse.urlparse(resolved).path)
+    )
+    if not resolved_path.startswith(base_path):
+        raise ThemeError(f"主题导入 URL 超出索引仓库范围: {resolved}")
+    return resolved
+
+
+def validate_theme_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("variant") not in {"light", "dark"}:
+        raise ThemeError("主题 variant 必须是 light 或 dark")
+    code_theme_id = payload.get("codeThemeId")
+    if not isinstance(code_theme_id, str) or not SAFE_THEME_ID.fullmatch(code_theme_id):
+        raise ThemeError("主题 codeThemeId 只能包含字母、数字、点、下划线和连字符")
+    theme = payload.get("theme")
+    if not isinstance(theme, dict):
+        raise ThemeError("主题缺少 theme 对象")
+
+    item_count = 0
+
+    def validate_value(value: Any, path: str, depth: int) -> None:
+        nonlocal item_count
+        item_count += 1
+        if item_count > MAX_THEME_ITEMS:
+            raise ThemeError(f"主题字段过多，最多允许 {MAX_THEME_ITEMS} 项")
+        if depth > MAX_THEME_DEPTH:
+            raise ThemeError(f"主题嵌套过深: {path}")
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if not isinstance(key, str) or not SAFE_THEME_KEY.fullmatch(key):
+                    raise ThemeError(f"主题字段名不安全: {path}.{key!r}")
+                validate_value(child, f"{path}.{key}", depth + 1)
+            return
+        if isinstance(value, list):
+            for index, child in enumerate(value):
+                validate_value(child, f"{path}[{index}]", depth + 1)
+            return
+        if isinstance(value, str):
+            if len(value) > MAX_THEME_STRING_LENGTH:
+                raise ThemeError(f"主题字符串过长: {path}")
+            if any(ord(character) < 32 or ord(character) == 127 for character in value):
+                raise ThemeError(f"主题字符串包含控制字符: {path}")
+            return
+        if isinstance(value, bool):
+            return
+        if isinstance(value, (int, float)):
+            if not math.isfinite(value):
+                raise ThemeError(f"主题数字必须是有限值: {path}")
+            return
+        raise ThemeError(f"主题字段类型不受支持: {path} ({type(value).__name__})")
+
+    validate_value(theme, "theme", 0)
+    for key in ("accent", "ink", "surface"):
+        value = theme.get(key)
+        if not isinstance(value, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            raise ThemeError(f"theme.{key} 必须是 #RRGGBB 颜色")
+    contrast = theme.get("contrast")
+    if isinstance(contrast, bool) or not isinstance(contrast, (int, float)):
+        raise ThemeError("theme.contrast 必须是数字")
+    return payload
 
 
 def parse_theme_payload(text: str) -> dict[str, Any]:
@@ -109,25 +228,14 @@ def parse_theme_payload(text: str) -> dict[str, Any]:
     if not line.startswith(THEME_PREFIX):
         raise ThemeError(f"主题数据必须以 {THEME_PREFIX} 开头")
     try:
-        payload = json.loads(line[len(THEME_PREFIX) :])
-    except json.JSONDecodeError as exc:
+        payload = json.loads(
+            line[len(THEME_PREFIX) :], parse_constant=_reject_json_constant
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
         raise ThemeError(f"主题数据不是有效 JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise ThemeError("主题数据根节点必须是对象")
-    if payload.get("variant") not in {"light", "dark"}:
-        raise ThemeError("主题 variant 必须是 light 或 dark")
-    if not isinstance(payload.get("codeThemeId"), str) or not payload["codeThemeId"]:
-        raise ThemeError("主题缺少 codeThemeId")
-    theme = payload.get("theme")
-    if not isinstance(theme, dict):
-        raise ThemeError("主题缺少 theme 对象")
-    for key in ("accent", "ink", "surface"):
-        value = theme.get(key)
-        if not isinstance(value, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
-            raise ThemeError(f"theme.{key} 必须是 #RRGGBB 颜色")
-    if not isinstance(theme.get("contrast"), (int, float)):
-        raise ThemeError("theme.contrast 必须是数字")
-    return payload
+    return validate_theme_payload(payload)
 
 
 def download_theme(
@@ -157,18 +265,26 @@ def choose_random_theme(
     return chooser.choice(alternatives or candidates)
 
 
+def _toml_key(value: str) -> str:
+    if SAFE_THEME_KEY.fullmatch(value):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
 def _toml_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not math.isfinite(value):
+            raise ThemeError("不能将非有限数字写入 TOML")
         return str(value)
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(item) for item in value) + "]"
     if isinstance(value, dict):
         fields = ", ".join(
-            f"{key} = {_toml_value(item)}" for key, item in value.items()
+            f"{_toml_key(key)} = {_toml_value(item)}" for key, item in value.items()
         )
         return "{ " + fields + " }"
     raise ThemeError(f"不能转换为 TOML 的值: {type(value).__name__}")
@@ -452,6 +568,7 @@ def apply_payload(
     no_restart: bool = False,
     live: bool | None = None,
 ) -> list[str]:
+    validate_theme_payload(payload)
     config_path = config_path.expanduser().resolve()
     backup = backup_config(config_path)
     messages: list[str] = []
@@ -679,10 +796,19 @@ def print_theme_list(themes: list[dict[str, Any]], mode: str | None) -> None:
     selected = [theme for theme in themes if mode is None or theme.get("mode") == mode]
     width = max((len(str(theme["slug"])) for theme in selected), default=4)
     for theme in selected:
+        name = safe_display_text(theme.get("name", ""))
         print(
             f"{str(theme['slug']):<{width}}  {str(theme['mode']):<5}  "
-            f"{theme.get('name', '')}"
+            f"{name}"
         )
+
+
+def safe_display_text(value: Any) -> str:
+    return "".join(
+        character
+        for character in str(value)
+        if ord(character) >= 32 and ord(character) != 127
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -693,6 +819,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""示例:
   codex-theme list
   codex-theme tokyo-night
+  codex-theme tokyo-night --dry-run
   codex-theme random --mode dark
   codex-theme restore
   codex-theme install-daily 09:00 --mode dark
@@ -708,6 +835,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--index-url", default=DEFAULT_INDEX_URL, help="主题索引 URL")
     parser.add_argument("--restart", action="store_true", help="应用后强制重启 Codex")
     parser.add_argument("--no-restart", action="store_true", help="只写配置，不重启 Codex")
+    parser.add_argument("--dry-run", action="store_true", help="预览修改，不写配置或重启")
     parser.add_argument("--live", action="store_true", help="强制尝试 macOS Live RPC")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出结果")
     parser.add_argument("--version", action="version", version=VERSION)
@@ -723,6 +851,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.restart and args.no_restart:
         parser.error("--restart 和 --no-restart 不能同时使用")
+    if args.dry_run and args.restart:
+        parser.error("--dry-run 和 --restart 不能同时使用")
 
     try:
         if command == "list":
@@ -768,6 +898,33 @@ def main(argv: list[str] | None = None) -> int:
                 if args.mode and theme.get("mode") != args.mode:
                     raise ThemeError(f"主题 {command} 不是 {args.mode} 模式")
             payload = download_theme(theme, args.index_url)
+            if args.dry_run:
+                preview = {
+                    "ok": True,
+                    "dry_run": True,
+                    "theme": safe_display_text(theme.get("name", theme["slug"])),
+                    "slug": theme["slug"],
+                    "variant": payload["variant"],
+                    "config_path": str(args.config.expanduser().resolve()),
+                    "edits": {
+                        f"desktop.{key}": value
+                        for key, value in appearance_edits(payload)
+                    },
+                }
+                if args.json:
+                    print(json.dumps(preview, ensure_ascii=False, indent=2))
+                else:
+                    print(f"预览主题: {preview['theme']} ({preview['variant']})")
+                    print(f"目标配置: {preview['config_path']}")
+                    print("不会写入配置，也不会重启 Codex")
+                    for key, value in preview["edits"].items():
+                        rendered = (
+                            json.dumps(value, ensure_ascii=False)
+                            if isinstance(value, dict)
+                            else str(value)
+                        )
+                        print(f"{key} = {rendered}")
+                return 0
             messages = apply_payload(
                 payload,
                 str(theme["slug"]),
@@ -777,7 +934,8 @@ def main(argv: list[str] | None = None) -> int:
                 live=True if args.live else None,
             )
             messages.append(
-                f"已应用 {theme.get('name', theme['slug'])} ({payload['variant']})"
+                f"已应用 {safe_display_text(theme.get('name', theme['slug']))} "
+                f"({payload['variant']})"
             )
 
         if args.json:

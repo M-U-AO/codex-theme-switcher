@@ -12,6 +12,8 @@
 - 支持 Light / Dark 筛选与随机主题
 - 随机时避免连续重复上一次主题
 - 修改前自动备份 `config.toml`，可一键恢复
+- `--dry-run` 安全预览，不写配置、不重启 Codex
+- 对远程 URL、下载大小、主题字段和 TOML 键进行安全校验
 - Windows Task Scheduler / macOS launchd 每日自动切换
 - macOS 实验性 App Server Live RPC，失败时自动回退到重启
 
@@ -26,6 +28,8 @@ Windows 尚未安装 Python 时，可以先执行：
 ```powershell
 winget install Python.Python.3.13
 ```
+
+Windows 版也会尝试使用 Codex Desktop 随附的 Python 运行时作为后备；该路径不是公开 API，长期使用仍建议单独安装 Python。
 
 ## 安装
 
@@ -61,6 +65,13 @@ codex-theme list
 codex-theme tokyo-night
 codex-theme catppuccin-mocha
 codex-theme nord
+```
+
+先预览将要写入的字段，不修改真实配置：
+
+```bash
+codex-theme tokyo-night --dry-run
+codex-theme tokyo-night --dry-run --json
 ```
 
 随机主题：
@@ -136,6 +147,14 @@ appearanceDarkChromeTheme = { ... }
 ```
 
 Light 主题对应 `appearanceLightCodeThemeId` 和 `appearanceLightChromeTheme`。模型、MCP、权限等其他配置保持不变。
+
+## 安全边界
+
+- 只接受 HTTPS 主题源，主题导入必须与索引同源并位于同一仓库路径下。
+- 下载内容限制为 2 MiB，并限制主题字段数量、嵌套深度、字符串长度和字段名格式。
+- 远程主题只能成为 `[desktop]` 下的外观值；TOML 键会安全序列化，不能借主题字段注入其他配置段。
+- 默认社区索引仍来自第三方仓库的 `main` 分支。使用前可先执行 `--dry-run`；对供应链要求更高时，应使用自己审查和托管的 `--index-url`。
+- Windows 普通应用会重启 Codex Desktop，可能中断正在进行的任务；`--no-restart` 只写配置。
 
 备份和状态保存在：
 

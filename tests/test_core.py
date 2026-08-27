@@ -1,9 +1,13 @@
+import contextlib
+import copy
+import io
 import json
 import random
 import sys
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -38,6 +42,118 @@ class PayloadTests(unittest.TestCase):
     def test_rejects_missing_prefix(self):
         with self.assertRaises(core.ThemeError):
             core.parse_theme_payload(json.dumps(PAYLOAD))
+
+    def test_rejects_unsafe_nested_key(self):
+        payload = copy.deepcopy(PAYLOAD)
+        payload["theme"][
+            'escape = 1 }\n[mcp_servers.injected]\ncommand = "bad"\n#'
+        ] = "ignored"
+
+        with self.assertRaisesRegex(core.ThemeError, "字段名不安全"):
+            core.parse_theme_payload(core.THEME_PREFIX + json.dumps(payload))
+
+    def test_rejects_non_finite_numbers(self):
+        encoded = core.THEME_PREFIX + json.dumps(PAYLOAD).replace("52", "NaN", 1)
+
+        with self.assertRaisesRegex(core.ThemeError, "不是有效 JSON"):
+            core.parse_theme_payload(encoded)
+
+    def test_rejects_boolean_contrast(self):
+        payload = copy.deepcopy(PAYLOAD)
+        payload["theme"]["contrast"] = True
+
+        with self.assertRaisesRegex(core.ThemeError, "contrast"):
+            core.parse_theme_payload(core.THEME_PREFIX + json.dumps(payload))
+
+
+class RemoteUrlTests(unittest.TestCase):
+    class FakeResponse:
+        def __init__(self, url, content=b"ok"):
+            self.url = url
+            self.content = content
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def geturl(self):
+            return self.url
+
+        def read(self, _limit):
+            return self.content
+
+    def test_resolves_import_inside_repository(self):
+        url = core.theme_import_url(
+            {"import": "themes/imports/tokyo-night.txt"}, core.DEFAULT_INDEX_URL
+        )
+
+        self.assertEqual(
+            url,
+            "https://raw.githubusercontent.com/shaw-baobao/codex-themes/"
+            "main/themes/imports/tokyo-night.txt",
+        )
+
+    def test_rejects_cross_origin_import(self):
+        with self.assertRaisesRegex(core.ThemeError, "同源"):
+            core.theme_import_url(
+                {"import": "https://example.com/theme.txt"}, core.DEFAULT_INDEX_URL
+            )
+
+    def test_rejects_repository_path_escape(self):
+        with self.assertRaisesRegex(core.ThemeError, "仓库范围"):
+            core.theme_import_url(
+                {"import": "../../other/repository/theme.txt"},
+                core.DEFAULT_INDEX_URL,
+            )
+
+    def test_rejects_encoded_repository_path_escape(self):
+        with self.assertRaisesRegex(core.ThemeError, "仓库范围"):
+            core.theme_import_url(
+                {"import": "%2e%2e/%2e%2e/other/repository/theme.txt"},
+                core.DEFAULT_INDEX_URL,
+            )
+
+    def test_rejects_non_https_index(self):
+        with self.assertRaisesRegex(core.ThemeError, "HTTPS"):
+            core.theme_import_url(
+                {"import": "themes/theme.txt"}, "http://example.com/themes/index.json"
+            )
+
+    def test_rejects_redirects(self):
+        response = self.FakeResponse("https://example.com/redirected.json")
+        with (
+            mock.patch.object(core.urllib.request, "urlopen", return_value=response),
+            self.assertRaisesRegex(core.ThemeError, "拒绝远程重定向"),
+        ):
+            core._read_url("https://example.com/index.json")
+
+    def test_rejects_oversized_download(self):
+        url = "https://example.com/index.json"
+        response = self.FakeResponse(url, b"x" * (core.MAX_DOWNLOAD_BYTES + 1))
+        with (
+            mock.patch.object(core.urllib.request, "urlopen", return_value=response),
+            self.assertRaisesRegex(core.ThemeError, "超过"),
+        ):
+            core._read_url(url)
+
+    def test_retries_transient_network_errors(self):
+        url = "https://example.com/index.json"
+        response = self.FakeResponse(url, b"ok")
+        with (
+            mock.patch.object(
+                core.urllib.request,
+                "urlopen",
+                side_effect=[core.urllib.error.URLError("temporary"), response],
+            ) as urlopen,
+            mock.patch.object(core.time, "sleep") as sleep,
+        ):
+            content = core._read_url(url)
+
+        self.assertEqual(content, "ok")
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once()
 
 
 class ConfigUpdateTests(unittest.TestCase):
@@ -93,6 +209,21 @@ value = 42
         parsed = tomllib.loads(updated)
         self.assertEqual(parsed["desktop"]["appearanceTheme"], "dark")
 
+    def test_serializer_cannot_escape_theme_inline_table(self):
+        payload = copy.deepcopy(PAYLOAD)
+        malicious_key = (
+            'escape = 1 }\n[mcp_servers.injected]\ncommand = "bad"\n#'
+        )
+        payload["theme"][malicious_key] = "ignored"
+
+        updated = core.update_config_text("", payload)
+        parsed = tomllib.loads(updated)
+
+        self.assertNotIn("mcp_servers", parsed)
+        self.assertEqual(
+            parsed["desktop"]["appearanceDarkChromeTheme"][malicious_key], "ignored"
+        )
+
 
 class RandomThemeTests(unittest.TestCase):
     def test_avoids_immediate_repeat(self):
@@ -105,6 +236,35 @@ class RandomThemeTests(unittest.TestCase):
             themes, mode="dark", last_slug="a", chooser=random.Random(1)
         )
         self.assertEqual(selected["slug"], "b")
+
+
+class CliTests(unittest.TestCase):
+    def test_dry_run_never_applies_payload(self):
+        themes = [
+            {
+                "slug": "tokyo-night",
+                "mode": "dark",
+                "name": "Tokyo Night",
+                "import": "themes/imports/tokyo-night.txt",
+            }
+        ]
+        output = io.StringIO()
+        with (
+            mock.patch.object(core, "load_theme_index", return_value=themes),
+            mock.patch.object(core, "download_theme", return_value=PAYLOAD),
+            mock.patch.object(core, "apply_payload") as apply_payload,
+            contextlib.redirect_stdout(output),
+        ):
+            result = core.main(["tokyo-night", "--dry-run", "--json"])
+
+        self.assertEqual(result, 0)
+        apply_payload.assert_not_called()
+        preview = json.loads(output.getvalue())
+        self.assertTrue(preview["dry_run"])
+        self.assertEqual(preview["slug"], "tokyo-night")
+
+    def test_display_text_removes_terminal_controls(self):
+        self.assertEqual(core.safe_display_text("safe\x1b[31mname"), "safe[31mname")
 
 
 if __name__ == "__main__":
