@@ -1,0 +1,24 @@
+[project]
+name = "codex-theme-switcher"
+version = "0.1.0"
+description = "Cross-platform native Appearance theme switcher for Codex Desktop"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "M-U-AO" }]
+keywords = ["codex", "theme", "appearance", "desktop"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://github.com/M-U-AO/codex-theme-switcher"
+Issues = "https://github.com/M-U-AO/codex-theme-switcher/issues"
+
+[tool.ruff]
+line-length = 99
+target-version = "py310"
+
