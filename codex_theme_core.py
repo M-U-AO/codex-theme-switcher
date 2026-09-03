@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.2.0"
+VERSION = "0.2.2"
 THEME_PREFIX = "codex-theme-v1:"
 DEFAULT_INDEX_URL = (
     "https://raw.githubusercontent.com/shaw-baobao/codex-themes/"
@@ -519,22 +519,26 @@ def try_live_write(payload: dict[str, Any], config_path: Path) -> tuple[bool, st
                 process.kill()
 
 
+def windows_restart_script() -> str:
+    return (
+        "$targets = Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.Path -like '*\\WindowsApps\\OpenAI.Codex_*' }; "
+        "$targets | Stop-Process -Force; "
+        "Start-Sleep -Milliseconds 1000; "
+        "$appId = (Get-StartApps | Where-Object { "
+        "$_.AppID -like 'OpenAI.Codex_*!App' -or $_.Name -eq 'Codex' } | "
+        "Select-Object -First 1).AppID; "
+        "if (-not $appId) { $appId = 'OpenAI.Codex_2p2nqsd0c76g0!App' }; "
+        "Start-Process explorer.exe -ArgumentList ('shell:AppsFolder\\' + $appId)"
+    )
+
+
 def restart_codex() -> tuple[bool, str]:
     system = platform.system()
     try:
         if system == "Windows":
-            script = (
-                "$targets = Get-Process -Name Codex -ErrorAction SilentlyContinue | "
-                "Where-Object { $_.Path -like '*\\WindowsApps\\OpenAI.Codex_*' }; "
-                "$targets | Stop-Process -Force; "
-                "Start-Sleep -Milliseconds 700; "
-                "$appId = (Get-StartApps | Where-Object { $_.Name -eq 'Codex' } | "
-                "Select-Object -First 1).AppID; "
-                "if (-not $appId) { $appId = 'OpenAI.Codex_2p2nqsd0c76g0!App' }; "
-                "Start-Process explorer.exe -ArgumentList ('shell:AppsFolder\\' + $appId)"
-            )
             result = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-Command", script],
+                ["powershell.exe", "-NoProfile", "-Command", windows_restart_script()],
                 check=False,
                 capture_output=True,
                 text=True,

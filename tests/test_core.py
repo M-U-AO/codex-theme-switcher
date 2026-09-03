@@ -239,6 +239,11 @@ class RandomThemeTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_windows_wrapper_is_ascii_for_legacy_powershell(self):
+        wrapper = Path(__file__).resolve().parents[1] / "codex-theme.ps1"
+
+        self.assertTrue(wrapper.read_bytes().isascii())
+
     def test_dry_run_never_applies_payload(self):
         themes = [
             {
@@ -265,6 +270,13 @@ class CliTests(unittest.TestCase):
 
     def test_display_text_removes_terminal_controls(self):
         self.assertEqual(core.safe_display_text("safe\x1b[31mname"), "safe[31mname")
+
+    def test_windows_restart_targets_current_codex_package(self):
+        script = core.windows_restart_script()
+
+        self.assertIn("Get-Process -Name ChatGPT,Codex", script)
+        self.assertIn("WindowsApps\\OpenAI.Codex_", script)
+        self.assertIn("OpenAI.Codex_*!App", script)
 
 
 if __name__ == "__main__":
