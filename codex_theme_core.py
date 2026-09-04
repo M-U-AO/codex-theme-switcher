@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 THEME_PREFIX = "codex-theme-v1:"
 DEFAULT_INDEX_URL = (
     "https://raw.githubusercontent.com/shaw-baobao/codex-themes/"
@@ -256,11 +256,21 @@ def choose_random_theme(
     themes: Iterable[dict[str, Any]],
     mode: str | None = None,
     last_slug: str | None = None,
+    last_mode: str | None = None,
     chooser: random.Random | Any = random,
 ) -> dict[str, Any]:
-    candidates = [item for item in themes if mode is None or item.get("mode") == mode]
+    theme_list = list(themes)
+    selected_mode = mode
+    if selected_mode is None and last_mode in {"light", "dark"}:
+        selected_mode = "dark" if last_mode == "light" else "light"
+
+    candidates = [
+        item for item in theme_list if selected_mode is None or item.get("mode") == selected_mode
+    ]
+    if not candidates and mode is None and selected_mode is not None:
+        candidates = theme_list
     if not candidates:
-        raise ThemeError(f"没有符合模式 {mode!r} 的主题")
+        raise ThemeError(f"没有符合模式 {selected_mode!r} 的主题")
     alternatives = [item for item in candidates if item.get("slug") != last_slug]
     return chooser.choice(alternatives or candidates)
 
@@ -894,8 +904,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             themes = load_theme_index(args.index_url)
             if command == "random":
+                state = load_state()
                 theme = choose_random_theme(
-                    themes, mode=args.mode, last_slug=load_state().get("last_theme")
+                    themes,
+                    mode=args.mode,
+                    last_slug=state.get("last_theme"),
+                    last_mode=state.get("last_mode"),
                 )
             else:
                 theme = find_theme(themes, command)

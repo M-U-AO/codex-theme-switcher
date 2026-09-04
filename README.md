@@ -9,7 +9,7 @@
 - Windows 与 macOS 使用一致的命令
 - 自动读取 [`shaw-baobao/codex-themes`](https://github.com/shaw-baobao/codex-themes) 的最新主题索引
 - 应用 `codex-theme-v1:` 原生导入数据
-- 支持 Light / Dark 筛选与随机主题
+- 支持 Light / Dark 筛选；裸 `random` 会在亮暗模式间自动交替
 - 随机时避免连续重复上一次主题
 - 修改前自动备份 `config.toml`，可一键恢复
 - `--dry-run` 安全预览，不写配置、不重启 Codex
@@ -82,6 +82,9 @@ codex-theme random --mode dark
 codex-theme random --mode light
 ```
 
+不指定 `--mode` 时，第一次从全部主题随机选择，之后会在上次模式的反面随机，
+即 Light 与 Dark 每次交替。显式指定 `--mode` 时始终按指定模式选择。
+
 默认情况下，普通配置写入后会重新启动 Codex Desktop，以确保界面刷新。只写配置、不重启：
 
 ```bash
@@ -102,11 +105,13 @@ codex-theme status
 
 ## 每日自动随机
 
-每天 09:00 随机选择暗色主题：
+每天 09:00 在亮色与暗色模式间交替，并在对应模式内随机选择主题：
 
 ```bash
-codex-theme install-daily 09:00 --mode dark
+codex-theme install-daily 09:00
 ```
+
+如需固定为暗色主题，可使用 `codex-theme install-daily 09:00 --mode dark`。
 
 取消每日任务：
 

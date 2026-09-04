@@ -237,6 +237,44 @@ class RandomThemeTests(unittest.TestCase):
         )
         self.assertEqual(selected["slug"], "b")
 
+    def test_alternates_from_light_to_dark(self):
+        themes = [
+            {"slug": "light-a", "mode": "light"},
+            {"slug": "dark-a", "mode": "dark"},
+            {"slug": "dark-b", "mode": "dark"},
+        ]
+
+        selected = core.choose_random_theme(
+            themes, last_slug="light-a", last_mode="light", chooser=random.Random(1)
+        )
+
+        self.assertEqual(selected["mode"], "dark")
+
+    def test_alternates_from_dark_to_light(self):
+        themes = [
+            {"slug": "light-a", "mode": "light"},
+            {"slug": "light-b", "mode": "light"},
+            {"slug": "dark-a", "mode": "dark"},
+        ]
+
+        selected = core.choose_random_theme(
+            themes, last_slug="dark-a", last_mode="dark", chooser=random.Random(1)
+        )
+
+        self.assertEqual(selected["mode"], "light")
+
+    def test_explicit_mode_overrides_alternation(self):
+        themes = [
+            {"slug": "light-a", "mode": "light"},
+            {"slug": "dark-a", "mode": "dark"},
+        ]
+
+        selected = core.choose_random_theme(
+            themes, mode="light", last_mode="light", chooser=random.Random(1)
+        )
+
+        self.assertEqual(selected["mode"], "light")
+
 
 class CliTests(unittest.TestCase):
     def test_windows_wrapper_is_ascii_for_legacy_powershell(self):
